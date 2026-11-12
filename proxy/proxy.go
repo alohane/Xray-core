@@ -770,25 +770,43 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		if splice {
 			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
-			//runtime.Gosched() // necessary
 			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			w, err := tc.ReadFrom(readerConn)
-			if readCounter != nil {
-				readCounter.Add(w) // outbound stats
+			const spliceChunk = int64(32 * 1024 * 1024)
+			for {
+				limited := &io.LimitedReader{R: readerConn, N: spliceChunk}
+				w, err := tc.ReadFrom(limited)
+				if readCounter != nil {
+					readCounter.Add(w) // outbound stats
+				}
+				if writeCounter != nil {
+					writeCounter.Add(w) // inbound stats
+				}
+				if statWriter != nil {
+					statWriter.Counter.Add(w) // user stats
+				}
+				if err != nil && errors.Cause(err) != io.EOF {
+					return err
+				}
+				if w < spliceChunk {
+					return nil
+				}
+				if controller := spliceControllerFromContext(ctx); controller != nil {
+					switch controller.CheckSplice() {
+					case SpliceFallback:
+						inbound.CanSpliceCopy = 3
+						splice = false
+					case SpliceReject:
+						return errors.New("splice connection rejected at chunk boundary")
+					}
+				}
+				if !splice {
+					break
+				}
 			}
-			if writeCounter != nil {
-				writeCounter.Add(w) // inbound stats
-			}
-			if statWriter != nil {
-				statWriter.Counter.Add(w) // user stats
-			}
-			if err != nil && errors.Cause(err) != io.EOF {
-				return err
-			}
-			return nil
+			continue
 		}
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
