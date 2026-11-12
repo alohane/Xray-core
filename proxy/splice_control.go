@@ -1,6 +1,9 @@
 package proxy
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // SpliceAction tells CopyRawConnIfExist what to do at a splice chunk boundary.
 type SpliceAction uint8
@@ -15,6 +18,8 @@ const (
 // safe to call from the copy goroutine and should return quickly.
 type SpliceController interface {
 	CheckSplice() SpliceAction
+	SpliceCheckInterval() time.Duration
+	FallbackIdleTimeout() time.Duration
 }
 
 type spliceControllerContextKey struct{}

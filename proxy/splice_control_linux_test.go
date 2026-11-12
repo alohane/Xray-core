@@ -185,6 +185,72 @@ func TestSpliceTimeoutCreatesCheckpointAndRestoresTimers(t *testing.T) {
 	}
 }
 
+func TestSpliceTimeoutCreditsPartialTrafficBeforeFallback(t *testing.T) {
+	sourceClient, sourceServer := tcpPair(t)
+	sinkClient, sinkServer := tcpPair(t)
+	defer sourceClient.Close()
+	defer sourceServer.Close()
+	defer sinkClient.Close()
+	defer sinkServer.Close()
+
+	const (
+		interval    = 50 * time.Millisecond
+		payloadSize = int64(1024 * 1024)
+	)
+	controller := &spliceTestController{action: proxy.SpliceFallback, interval: interval, idle: time.Second}
+	ctx := spliceContext(controller)
+	timer := signal.CancelAfterInactivity(ctx, func() {}, time.Minute)
+	defer timer.SetTimeout(0)
+	counter := new(countingCounter)
+	writer := &dispatcher.SizeStatWriter{Counter: counter, Writer: buf.NewWriter(sinkServer)}
+	copyResult := make(chan error, 1)
+	go func() { copyResult <- proxy.CopyRawConnIfExist(ctx, sourceServer, sinkServer, writer, timer, nil) }()
+
+	if _, err := io.CopyN(sourceClient, zeroReader{}, payloadSize); err != nil {
+		t.Fatal(err)
+	}
+	readResult := make(chan error, 1)
+	go func() {
+		_, err := io.CopyN(io.Discard, sinkClient, payloadSize)
+		readResult <- err
+	}()
+	select {
+	case err := <-readResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("partial payload did not reach the sink")
+	}
+	deadline := time.Now().Add(time.Second)
+	for controller.checks.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := controller.checks.Load(); got != 1 {
+		t.Fatalf("controller checks = %d, want one timeout checkpoint", got)
+	}
+	if got := counter.Value(); got != payloadSize {
+		t.Fatalf("traffic counter = %d, want partial payload %d", got, payloadSize)
+	}
+	if got := counter.calls.Load(); got != 1 {
+		t.Fatalf("counter Add calls = %d, want one timeout credit", got)
+	}
+
+	if tcp, ok := sourceClient.(*net.TCPConn); ok {
+		if err := tcp.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-copyResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("buffered fallback did not finish after source EOF")
+	}
+}
+
 func runSpliceTransfer(payloadSize int64, action proxy.SpliceAction) (*countingCounter, *spliceTestController, error) {
 	sourceClient, sourceServer, err := tcpConnectionPair()
 	if err != nil {

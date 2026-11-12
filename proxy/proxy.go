@@ -757,6 +757,14 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			return readV(ctx, reader, writer, timer, readCounter)
 		}
 	}
+	controller := spliceControllerFromContext(ctx)
+	spliceCheckInterval := 30 * time.Second
+	if controller != nil && controller.SpliceCheckInterval() > 0 {
+		spliceCheckInterval = controller.SpliceCheckInterval()
+	}
+	clearSpliceDeadline := func() {
+		_ = readerConn.SetReadDeadline(time.Time{})
+	}
 
 	for {
 		inbound := session.InboundFromContext(ctx)
@@ -776,6 +784,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			const spliceChunk = int64(32 * 1024 * 1024)
 			for {
+				if err := readerConn.SetReadDeadline(time.Now().Add(spliceCheckInterval)); err != nil {
+					return err
+				}
 				limited := &io.LimitedReader{R: readerConn, N: spliceChunk}
 				w, err := tc.ReadFrom(limited)
 				if readCounter != nil {
@@ -787,19 +798,34 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				if statWriter != nil {
 					statWriter.Counter.Add(w) // user stats
 				}
-				if err != nil && errors.Cause(err) != io.EOF {
+				cause := errors.Cause(err)
+				timedOut := false
+				if timeout, ok := cause.(interface{ Timeout() bool }); ok {
+					timedOut = timeout.Timeout()
+				}
+				if err != nil && cause != io.EOF && !timedOut {
+					clearSpliceDeadline()
 					return err
 				}
-				if w < spliceChunk {
+				if w < spliceChunk && !timedOut {
+					clearSpliceDeadline()
 					return nil
 				}
-				if controller := spliceControllerFromContext(ctx); controller != nil {
+				if controller != nil {
 					switch controller.CheckSplice() {
 					case SpliceFallback:
+						clearSpliceDeadline()
 						inbound.CanSpliceCopy = 3
+						if idleTimeout := controller.FallbackIdleTimeout(); idleTimeout > 0 {
+							timer.SetTimeout(idleTimeout)
+							if inTimer != nil {
+								inTimer.SetTimeout(idleTimeout)
+							}
+						}
 						splice = false
 					case SpliceReject:
-						return errors.New("splice connection rejected at chunk boundary")
+						clearSpliceDeadline()
+						return errors.New("splice connection rejected at checkpoint")
 					}
 				}
 				if !splice {
