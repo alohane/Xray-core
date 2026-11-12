@@ -757,7 +757,11 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			return readV(ctx, reader, writer, timer, readCounter)
 		}
 	}
-	controller := spliceControllerFromContext(ctx)
+	controllerState := spliceControllerFromContext(ctx)
+	var controller SpliceController
+	if controllerState != nil {
+		controller = controllerState.controller
+	}
 	spliceCheckInterval := 30 * time.Second
 	if controller != nil && controller.SpliceCheckInterval() > 0 {
 		spliceCheckInterval = controller.SpliceCheckInterval()
@@ -798,6 +802,10 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				if statWriter != nil {
 					statWriter.Counter.Add(w) // user stats
 				}
+				checkpointTime := time.Now()
+				if controllerState != nil {
+					controllerState.recordActivity(w, checkpointTime)
+				}
 				cause := errors.Cause(err)
 				timedOut := false
 				if timeout, ok := cause.(interface{ Timeout() bool }); ok {
@@ -826,6 +834,11 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 					case SpliceReject:
 						clearSpliceDeadline()
 						return errors.New("splice connection rejected at checkpoint")
+					default:
+						if idleTimeout := controller.FallbackIdleTimeout(); idleTimeout > 0 && controllerState.idleFor(checkpointTime) >= idleTimeout {
+							clearSpliceDeadline()
+							return nil
+						}
 					}
 				}
 				if !splice {

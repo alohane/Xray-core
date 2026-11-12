@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,13 +25,34 @@ type SpliceController interface {
 
 type spliceControllerContextKey struct{}
 
+type spliceControllerState struct {
+	controller   SpliceController
+	lastActivity atomic.Int64
+}
+
+func newSpliceControllerState(controller SpliceController) *spliceControllerState {
+	state := &spliceControllerState{controller: controller}
+	state.lastActivity.Store(time.Now().UnixNano())
+	return state
+}
+
+func (s *spliceControllerState) recordActivity(transferred int64, now time.Time) {
+	if transferred > 0 {
+		s.lastActivity.Store(now.UnixNano())
+	}
+}
+
+func (s *spliceControllerState) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, s.lastActivity.Load()))
+}
+
 // ContextWithSpliceController installs a controller checked between splice
 // chunks. Core users that do not install one retain the upstream behavior.
 func ContextWithSpliceController(ctx context.Context, controller SpliceController) context.Context {
-	return context.WithValue(ctx, spliceControllerContextKey{}, controller)
+	return context.WithValue(ctx, spliceControllerContextKey{}, newSpliceControllerState(controller))
 }
 
-func spliceControllerFromContext(ctx context.Context) SpliceController {
-	controller, _ := ctx.Value(spliceControllerContextKey{}).(SpliceController)
-	return controller
+func spliceControllerFromContext(ctx context.Context) *spliceControllerState {
+	state, _ := ctx.Value(spliceControllerContextKey{}).(*spliceControllerState)
+	return state
 }

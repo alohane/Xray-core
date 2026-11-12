@@ -14,6 +14,10 @@ Intentional differences:
   may keep splicing, fall back to the buffered path, or reject the connection.
   On fallback the read deadline is cleared and both activity timers return to
   the controller's normal policy idle timeout.
+- The controller context shares the latest splice activity timestamp across
+  both copy directions. An otherwise healthy but fully idle connection closes
+  after the normal policy idle timeout instead of retaining the 24-hour splice
+  safety timer; one-way traffic keeps the connection alive.
 - Linux socket tests cover exact multi-chunk accounting, partial accounting at
   a time checkpoint, buffered fallback, rejection, and timer restoration.
 

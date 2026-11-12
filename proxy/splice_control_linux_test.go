@@ -251,6 +251,108 @@ func TestSpliceTimeoutCreditsPartialTrafficBeforeFallback(t *testing.T) {
 	}
 }
 
+func TestSpliceIdleClosesAtPolicyTimeout(t *testing.T) {
+	sourceClient, sourceServer := tcpPair(t)
+	sinkClient, sinkServer := tcpPair(t)
+	defer sourceClient.Close()
+	defer sourceServer.Close()
+	defer sinkClient.Close()
+	defer sinkServer.Close()
+
+	const (
+		interval = 25 * time.Millisecond
+		idle     = 75 * time.Millisecond
+	)
+	controller := &spliceTestController{action: proxy.SpliceContinue, interval: interval, idle: idle}
+	ctx := spliceContext(controller)
+	timer := signal.CancelAfterInactivity(ctx, func() {}, time.Minute)
+	defer timer.SetTimeout(0)
+	writer := &dispatcher.SizeStatWriter{Counter: new(countingCounter), Writer: buf.NewWriter(sinkServer)}
+	copyResult := make(chan error, 1)
+	started := time.Now()
+	go func() { copyResult <- proxy.CopyRawConnIfExist(ctx, sourceServer, sinkServer, writer, timer, nil) }()
+
+	select {
+	case err := <-copyResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle splice did not close at the policy timeout")
+	}
+	if elapsed := time.Since(started); elapsed < idle || elapsed > time.Second {
+		t.Fatalf("idle splice lifetime = %v, want %v..1s", elapsed, idle)
+	}
+}
+
+func TestSpliceIdleUsesActivityFromBothDirections(t *testing.T) {
+	const (
+		interval = 20 * time.Millisecond
+		idle     = 120 * time.Millisecond
+	)
+	controller := &spliceTestController{action: proxy.SpliceContinue, interval: interval, idle: idle}
+	ctx := spliceContext(controller)
+
+	idleSourceClient, idleSourceServer := tcpPair(t)
+	idleSinkClient, idleSinkServer := tcpPair(t)
+	defer idleSourceClient.Close()
+	defer idleSourceServer.Close()
+	defer idleSinkClient.Close()
+	defer idleSinkServer.Close()
+	idleTimer := signal.CancelAfterInactivity(ctx, func() {}, time.Minute)
+	defer idleTimer.SetTimeout(0)
+	idleResult := make(chan error, 1)
+	go func() {
+		writer := &dispatcher.SizeStatWriter{Counter: new(countingCounter), Writer: buf.NewWriter(idleSinkServer)}
+		idleResult <- proxy.CopyRawConnIfExist(ctx, idleSourceServer, idleSinkServer, writer, idleTimer, nil)
+	}()
+
+	time.Sleep(70 * time.Millisecond)
+	activeSourceClient, activeSourceServer := tcpPair(t)
+	activeSinkClient, activeSinkServer := tcpPair(t)
+	defer activeSourceClient.Close()
+	defer activeSourceServer.Close()
+	defer activeSinkClient.Close()
+	defer activeSinkServer.Close()
+	activeTimer := signal.CancelAfterInactivity(ctx, func() {}, time.Minute)
+	defer activeTimer.SetTimeout(0)
+	activeResult := make(chan error, 1)
+	go func() {
+		writer := &dispatcher.SizeStatWriter{Counter: new(countingCounter), Writer: buf.NewWriter(activeSinkServer)}
+		activeResult <- proxy.CopyRawConnIfExist(ctx, activeSourceServer, activeSinkServer, writer, activeTimer, nil)
+	}()
+	payload := []byte("activity from the other splice direction")
+	if _, err := activeSourceClient.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if tcp, ok := activeSourceClient.(*net.TCPConn); ok {
+		if err := tcp.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(activeSinkClient, received); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-activeResult; err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-idleResult:
+		t.Fatalf("opposite-direction activity did not extend idle lifetime: %v", err)
+	case <-time.After(70 * time.Millisecond):
+	}
+	select {
+	case err := <-idleResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("idle splice did not close after shared activity stopped")
+	}
+}
+
 func runSpliceTransfer(payloadSize int64, action proxy.SpliceAction) (*countingCounter, *spliceTestController, error) {
 	sourceClient, sourceServer, err := tcpConnectionPair()
 	if err != nil {
