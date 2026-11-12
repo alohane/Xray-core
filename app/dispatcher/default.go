@@ -198,21 +198,27 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
-		if p.Stats.UserUplink {
-			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
-				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
-			}
-		}
-		if p.Stats.UserDownlink {
-			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
-				link.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  link.Writer,
+		WithCounterReferences(ctx, func() []stats.Counter {
+			var attached []stats.Counter
+			if p.Stats.UserUplink {
+				name := "user>>>" + user.Email + ">>>traffic>>>uplink"
+				if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
+					link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+					attached = append(attached, c)
 				}
 			}
-		}
+			if p.Stats.UserDownlink {
+				name := "user>>>" + user.Email + ">>>traffic>>>downlink"
+				if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
+					link.Writer = &SizeStatWriter{
+						Counter: c,
+						Writer:  link.Writer,
+					}
+					attached = append(attached, c)
+				}
+			}
+			return attached
+		})
 		if p.Stats.UserOnline {
 			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
 		}

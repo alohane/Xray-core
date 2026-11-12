@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -53,45 +54,78 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
 		}
-		getX509KeyPair := func() *tls.Certificate {
-			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
-			if err != nil {
-				errors.LogWarningInner(context.Background(), err, "ignoring invalid X509 key pair")
-				return nil
-			}
-			keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
-			if err != nil {
-				errors.LogWarningInner(context.Background(), err, "ignoring invalid certificate")
-				return nil
-			}
-			return &keyPair
-		}
-		if keyPair := getX509KeyPair(); keyPair != nil {
+		if keyPair := loadX509KeyPair(entry); keyPair != nil {
 			certs = append(certs, keyPair)
-		} else {
+		}
+	}
+	return certs
+}
+
+func loadX509KeyPair(entry *Certificate) *tls.Certificate {
+	keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
+	if err != nil {
+		errors.LogWarningInner(context.Background(), err, "ignoring invalid X509 key pair")
+		return nil
+	}
+	keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
+	if err != nil {
+		errors.LogWarningInner(context.Background(), err, "ignoring invalid certificate")
+		return nil
+	}
+	return &keyPair
+}
+
+type certificateStore struct {
+	certs []atomic.Pointer[tls.Certificate]
+}
+
+func newCertificateStore(c *Config) *certificateStore {
+	valid := make([]struct {
+		entry   *Certificate
+		keyPair *tls.Certificate
+	}, 0, len(c.Certificate))
+	for _, entry := range c.Certificate {
+		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
 		}
-		index := len(certs) - 1
+		keyPair := loadX509KeyPair(entry)
+		if keyPair == nil {
+			continue
+		}
+		valid = append(valid, struct {
+			entry   *Certificate
+			keyPair *tls.Certificate
+		}{entry: entry, keyPair: keyPair})
+	}
+	store := &certificateStore{certs: make([]atomic.Pointer[tls.Certificate], len(valid))}
+	for index, item := range valid {
+		entry := item.entry
+		store.certs[index].Store(item.keyPair)
 		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+			current := store.certs[index].Load()
+			next := current
 			if isReloaded {
-				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
-					cert = newKeyPair
-				} else {
+				next = loadX509KeyPair(entry)
+				if next == nil {
 					return
 				}
 			}
 			if isOcspstapling {
-				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
+				newOCSPData, err := ocsp.GetOCSPForCert(next.Certificate)
+				if err != nil {
 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
-				} else if string(newOCSPData) != string(cert.OCSPStaple) {
-					cert.OCSPStaple = newOCSPData
+				} else if string(newOCSPData) != string(next.OCSPStaple) {
+					cloned := *next
+					cloned.OCSPStaple = newOCSPData
+					next = &cloned
 				}
 			}
-			certs[index] = cert
+			if next != current {
+				store.certs[index].Store(next)
+			}
 		})
 	}
-	return certs
+	return store
 }
 
 func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
@@ -244,20 +278,21 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (s *certificateStore) getCertificateFunc(rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		if len(certs) == 0 {
+		if len(s.certs) == 0 {
 			return nil, errNoCertificates
 		}
 		sni := strings.ToLower(hello.ServerName)
-		if !rejectUnknownSNI && (len(certs) == 1 || sni == "") {
-			return certs[0], nil
+		if !rejectUnknownSNI && (len(s.certs) == 1 || sni == "") {
+			return s.certs[0].Load(), nil
 		}
 		gsni := "*"
 		if index := strings.IndexByte(sni, '.'); index != -1 {
 			gsni += sni[index:]
 		}
-		for _, keyPair := range certs {
+		for i := range s.certs {
+			keyPair := s.certs[i].Load()
 			if keyPair.Leaf.Subject.CommonName == sni || keyPair.Leaf.Subject.CommonName == gsni {
 				return keyPair, nil
 			}
@@ -270,7 +305,7 @@ func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) f
 		if rejectUnknownSNI {
 			return nil, errNoCertificates
 		}
-		return certs[0], nil
+		return s.certs[0].Load(), nil
 	}
 }
 
@@ -412,7 +447,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if len(caCerts) > 0 {
 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
+		config.GetCertificate = newCertificateStore(c).getCertificateFunc(c.RejectUnknownSni)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {

@@ -73,6 +73,22 @@ func TestInsecureCertificates(t *testing.T) {
 	}
 }
 
+func TestConcurrentCertificateSelectionDuringInitialRefresh(t *testing.T) {
+	leaf, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
+	c := &Config{Certificate: []*Certificate{ParseCertificate(leaf)}}
+	tlsConfig := c.GetTLSConfig()
+	hello := &gotls.ClientHelloInfo{ServerName: "localhost"}
+	for i := 0; i < 1000; i++ {
+		selected, err := tlsConfig.GetCertificate(hello)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if selected == nil {
+			t.Fatal("certificate selection returned nil")
+		}
+	}
+}
+
 func BenchmarkCertificateIssuing(b *testing.B) {
 	ct, _ := cert.MustGenerate(nil, cert.Authority(true), cert.KeyUsage(x509.KeyUsageCertSign))
 	certificate := ParseCertificate(ct)

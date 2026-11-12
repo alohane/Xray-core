@@ -20,6 +20,11 @@ Intentional differences:
   safety timer; one-way traffic keeps the connection alive.
 - Linux socket tests cover exact multi-chunk accounting, partial accounting at
   a time checkpoint, buffered fallback, rejection, and timer restoration.
+- User traffic counter references are shared by the core and XrayR dispatcher
+  wrappers so retirement cannot unregister a counter still held by VLESS
+  reverse/mux or another live link.
+- TLS certificate and OCSP refresh publishes immutable certificate snapshots
+  atomically, avoiding concurrent mutation during TCP or QUIC handshakes.
 
 Keep `app/dispatcher.SizeStatWriter` as the concrete writer recognized by the
 splice path. Rebase these changes deliberately when updating xray-core.
